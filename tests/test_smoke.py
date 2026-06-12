@@ -120,7 +120,7 @@ def test_registry_and_render():
 
 def test_yaml_hazard_recovery():
     """Regression: a value starting with a backtick (illegal plain YAML) must not
-    discard sibling findings. Observed live with MiniMax M3 on the sophia repo."""
+    discard sibling findings. Observed live with MiniMax M3 on a real repo."""
     hazard = """pid: config
 src: src/config.py:1-10
 sev: High

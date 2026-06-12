@@ -20,10 +20,10 @@ copy .env.example .env     # then add your API keys
 
 ```bash
 # Everything on MiniMax (cheapest)
-python scripts/run_audit.py --target C:\Users\stlji\gitlab\sophia --provider minimax
+python scripts/run_audit.py --target C:\path\to\your-repo --provider minimax
 
 # Mixed routing: bulk scanning on MiniMax, judgment nodes on Sonnet
-python scripts/run_audit.py --target C:\Users\stlji\gitlab\sophia --provider minimax --judgment-provider anthropic
+python scripts/run_audit.py --target C:\path\to\your-repo --provider minimax --judgment-provider anthropic
 ```
 
 Judgment nodes = risk prioritization, threat cross-reference, consolidation,

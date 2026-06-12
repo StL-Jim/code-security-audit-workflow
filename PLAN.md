@@ -36,7 +36,7 @@ Modules (`src/audit/`):
 - [x] `tests/test_smoke.py` -- scoring, parsing, registry+resume, rendering,
       YAML-hazard regression, partition model. All pass.
 
-Validation (live, against `C:\Users\stlji\gitlab\sophia`, MiniMax M3):
+Validation (live, against a real 13-partition repo, MiniMax M3):
 - [x] Phase 1 discovery: parseable prose + 13-partition JSON plan. ~$0.04.
 - [x] Phase 2 prioritization + Phase 3A security worker (config partition):
       model emitted 9 conformant findings with evidence, NIST mappings, and
