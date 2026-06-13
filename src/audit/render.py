@@ -204,7 +204,8 @@ def _finding_entry(f: dict, unanticipated: bool = False) -> str:
 
 
 def render_consolidated_report(project: str, registry, sections_md: dict,
-                               attack_paths_md: str) -> str:
+                               attack_paths_md: str,
+                               classification: str = "Internal Use Only") -> str:
     """Final report: every finding in the registry, full detail."""
     counts = registry.counts_by_severity()
     toc = [("summary", "Executive Summary"), ("coverage", "Partition Coverage"),
@@ -227,11 +228,12 @@ def render_consolidated_report(project: str, registry, sections_md: dict,
     n = len(registry.findings)
     return _page(f"Security & Architecture Audit -- {project}",
                  f"{n} findings | comprehensive report", toc, body,
-                 "Confidential -- Internal Use Only")
+                 classification)
 
 
 def render_executive_briefing(project: str, registry, summary_md: str,
-                              attack_paths_md: str) -> str:
+                              attack_paths_md: str,
+                              classification: str = "Internal Use Only") -> str:
     """Briefing: Critical/High findings only, plus top attack paths."""
     crit_high = [f for f in registry.sorted_findings()
                  if (f.get("sev") or "").lower() in ("critical", "high")]
@@ -249,14 +251,15 @@ def render_executive_briefing(project: str, registry, summary_md: str,
     )
     return _page(f"Executive Briefing -- {project}",
                  f"{len(crit_high)} Critical/High findings", toc, body,
-                 "Confidential -- Executive Briefing")
+                 classification)
 
 
-def render_comparison_html(project: str, comparison_md: str) -> str:
+def render_comparison_html(project: str, comparison_md: str,
+                           classification: str = "Internal Use Only") -> str:
     """Render the COORDINATED-mode threat-audit comparison Markdown to HTML."""
     toc = [("comparison", "Threat-Audit Comparison")]
     body = (f'<section id="comparison"><h2>Threat-Audit Comparison</h2>'
             f'<div class="prose">{md_to_html(comparison_md)}</div></section>')
     return _page(f"Threat-Audit Comparison -- {project}",
                  "Headline deliverable: what the threat model anticipated vs. code reality",
-                 toc, body, "Confidential -- Internal Use Only")
+                 toc, body, classification)

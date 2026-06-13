@@ -22,6 +22,12 @@ Output rules (strictly enforced):
    "UNCERTAIN: <reason>" rather than guessing.
 6. CWE references are fine; cite a CVE id ONLY if it literally appears in the
    source files provided.
+7. SECRETS REDACTION (mandatory): when you find a secret value (API key,
+   password, token, connection string, private key), report the file path and
+   line, the key/variable name, and a masked fragment only (first 4 chars +
+   ****, e.g. AKIA****). NEVER reproduce the full secret value in any finding,
+   evidence block, or report -- the finding is the LOCATION of the secret, not
+   the secret itself.
 """
 
 # Worker phases must emit findings in this exact YAML shape. Python computes the
@@ -41,8 +47,8 @@ src: <file:line, e.g. src/auth/login.py:45-52>
 class: Confirmed | Suspected | Not Assessable
 sev: Critical | High | Medium | Low | Info
 conf: High | Medium | Low
-cat: <OWASP, e.g. A01:2021>
-sub: <subcategory, e.g. IDOR, SQL Injection>
+cat: <OWASP, e.g. A01:2021; use ARCH for architecture findings with no meaningful OWASP mapping>
+sub: <subcategory, e.g. IDOR, SQL Injection; for ARCH e.g. Tight Coupling, Missing Bulkhead>
 title: <<=80 chars>
 scope: local | module | service-wide | cross-service | global
 deps: local | shared | boundary-crossing
@@ -58,8 +64,8 @@ fix: |
 verify: |
   <how to confirm the fix works>
 status: open
-threat_id: <COORDINATED only: matching threat id, else omit>
-threat_match: <COORDINATED only: confirms | partial | unanticipated, else omit>
+threat_id: <COORDINATED only: matching threat id (0001-style, INF-/THR- prefixed, or EX-NNN for ledger matches), else omit>
+threat_match: <COORDINATED only: confirms | partial | promotes-inferred | contradicts-exclusion | excluded-by-design | unanticipated, else omit>
 
 YAML safety: if a single-line value (title, sub, src, etc.) starts with a
 backtick, quote, asterisk, or contains a colon-space, wrap the whole value in
@@ -133,11 +139,26 @@ def security_worker_instructions(project: str, partition, exposure: str,
     if coordinated:
         coord = (
             "\nCOORDINATED MODE: after forming each finding, cross-reference it "
-            "against the threats below. Set threat_match to `confirms` (strong "
-            "match: same component+OWASP, technical content aligns), `partial` "
-            "(same component, related concern), or `unanticipated` (no matching "
-            "threat -- these are the highest-value findings). Set threat_id to the "
-            "matched id, or omit for unanticipated. Do NOT invent new threats.\n\n"
+            "against the threat model content below. It contains up to three "
+            "matchable structures: the MAIN threat table (Confirmed/Likely), the "
+            "INFERRED threats table (unverified, with a WhatWouldConfirm column), "
+            "and the EXCLUDED THREATS LEDGER (EX-NNN rows of considered-but-"
+            "excluded candidates; may be absent in older threat models). Scan in "
+            "this order and stop at the first qualifying match:\n"
+            "1. MAIN strong match (same component+OWASP, content aligns) -> "
+            "threat_match: confirms\n"
+            "2. MAIN partial match (same component, related concern) -> "
+            "threat_match: partial\n"
+            "3. INFERRED strong match where your finding answers the threat's "
+            "WhatWouldConfirm question -> threat_match: promotes-inferred (high "
+            "value: the audit completes verification the model could not)\n"
+            "4. LEDGER match where the Exclusion Reason begins 'Fully mitigated' "
+            "-> threat_match: contradicts-exclusion, threat_id: the EX-NNN id "
+            "(highest value: the mitigation judgment was wrong). LEDGER match "
+            "with any other exclusion reason -> threat_match: excluded-by-design\n"
+            "5. No match anywhere -> threat_match: unanticipated\n"
+            "Set threat_id to the matched id, or omit for unanticipated. Do NOT "
+            "invent new threats.\n\n"
             f"## Threat model threats\n{tm_threats}\n"
         )
     return f"""PHASE 3A -- SECURITY REVIEW of partition `{partition.id}`
@@ -161,8 +182,11 @@ def architecture_worker_instructions(project: str, partition, exposure: str,
     if coordinated:
         coord = (
             "\nCOORDINATED MODE: cross-reference each architecture finding against "
-            "the threats below using the same confirms/partial/unanticipated "
-            f"semantics.\n\n## Threat model threats\n{tm_threats}\n"
+            "the threat model content below using the same matching order as the "
+            "security review: confirms / partial (main table), promotes-inferred "
+            "(Inferred table), contradicts-exclusion / excluded-by-design "
+            "(Excluded Threats Ledger), unanticipated (no match).\n\n"
+            f"## Threat model threats\n{tm_threats}\n"
         )
     return f"""PHASE 4A -- ARCHITECTURE + FUNCTIONAL REVIEW of partition
 `{partition.id}` ({partition.name}, root: {partition.root}) for `{project}`.
@@ -171,7 +195,9 @@ Deployment exposure: {exposure}. Review ONLY this partition plus directly
 relevant shared/boundary files. Analyze: coupling/cohesion, dependency
 direction, boundary violations, shared-state risks, error handling,
 resilience/failure modes, race conditions, edge cases, operational fragility.
-Record each issue as a finding using the schema.
+Record each issue as a finding using the schema. Use cat: ARCH for findings
+with no meaningful OWASP mapping -- do not force-fit an OWASP category onto a
+non-security architecture finding.
 {coord}{prior_ctx}"""
 
 
@@ -204,7 +230,9 @@ runtime/config/environment access to assess.
 
 
 def comparison_instructions(project: str, threats_md: str,
-                            confirms, partials, unanticipated) -> str:
+                            confirms, partials, unanticipated,
+                            promoted="None.", contradicts="None.",
+                            excluded_by_design="None.") -> str:
     return f"""PHASE 5 -- THREAT-AUDIT COMPARISON (Markdown) for `{project}`.
 
 This is the headline deliverable. Produce comprehensive Markdown a reader can
@@ -212,28 +240,52 @@ use standalone -- reproduce actual content (threat descriptions, finding
 evidence and fixes), not just IDs. Use these sections:
 
 Section 1: Executive Summary -- one paragraph on how well the threat model
-anticipated code reality, plus a counts table (total threats, total findings,
-confirmed, partial, unconfirmed, unanticipated, with percentages).
+anticipated code reality, plus a counts table (total threats main/Inferred,
+total findings, confirmed, partial, promoted-from-Inferred, exclusion
+contradictions, unconfirmed, unanticipated, with percentages).
+SEVERITY-FLOOR STRATIFICATION (mandatory): the threat model excludes Medium and
+Low severity threats BY DESIGN, so every Medium/Low/Info audit finding is
+structurally guaranteed not to match a threat. The counts table MUST report
+"unanticipated (Critical/High)" -- the true threat-model misses -- separately
+from "unanticipated (Medium/Low/Info)" -- expected non-matches given the
+model's severity floor. Use the Critical/High number when characterizing how
+much the threat model missed, with one sentence explaining why lower-severity
+non-matches are expected.
 
 Section 2: Threats Confirmed by Audit -- one detail block per confirmed threat:
 threat-model context (severity, component, description, original mitigation),
 each confirming finding (location, issue, evidence, fix), and a one-sentence
-synthesis of how the evidence validates the threat. Sort by severity.
+synthesis of how the evidence validates the threat. Include promoted Inferred
+threats here, clearly labeled "PROMOTED FROM INFERRED", quoting the threat's
+original WhatWouldConfirm question alongside the finding evidence that answers
+it. Sort by severity.
 
 Section 3: Threats Not Confirmed -- one block per threat with no confirming or
 partial finding. Classify each as: well-mitigated in code | audit did not reach
 this code | architectural threat not observable in code | unable to determine.
 Give the reasoning. "Unable to determine" is an honest, acceptable answer.
 
-Section 4: Audit Findings Not Anticipated -- one block per unanticipated finding
-with full content (severity, OWASP, location, issue, evidence, impact, fix,
-verify) and a note on why the threat model missed it. Highest-value section.
+Section 4: Audit Findings Not Anticipated -- entries for unanticipated and
+contradicts-exclusion findings, with full content (severity, OWASP, location,
+issue, evidence, impact, fix, verify) and a note on why the threat model missed
+it. contradicts-exclusion entries come FIRST, labeled "CONTRADICTS THREAT MODEL
+EXCLUSION", quoting the ledger row (EX-NNN, exclusion reason) the finding
+disproves -- these are the most serious entries. Group remaining unanticipated
+entries: Critical/High first (genuine misses), then Medium/Low/Info under a
+subheading noting they are expected given the model's severity floor. Findings
+with threat_match excluded-by-design get only a compact table at the end
+(FindingID, severity, EX-NNN, exclusion reason) -- deliberate scoping
+decisions, not misses; do not count them in unanticipated totals.
 
 Section 5: Partial Matches -- one block per partially-matched threat: what the
 finding addresses and what remains uncovered.
 
-Section 6: Coverage Analysis -- confirmation rates (severity-weighted and not),
-anticipated-vs-unanticipated split, severity correlation, component blind spots.
+Section 6: Coverage Analysis -- confirmation rates (severity-weighted and not,
+main table and Inferred reported separately), anticipated-vs-unanticipated
+split computed twice (all findings, and Critical/High only -- the Critical/High
+figure is the meaningful one; say explicitly that the all-findings figure is
+depressed by the model's deliberate severity floor), severity correlation,
+component blind spots.
 
 Do NOT include a recommendations/roadmap/next-steps section.
 
@@ -245,6 +297,15 @@ Do NOT include a recommendations/roadmap/next-steps section.
 
 ## Partial findings
 {partials}
+
+## Promoted-from-Inferred findings
+{promoted}
+
+## Exclusion-contradicting findings
+{contradicts}
+
+## Excluded-by-design findings
+{excluded_by_design}
 
 ## Unanticipated findings
 {unanticipated}"""

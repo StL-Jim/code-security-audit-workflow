@@ -53,7 +53,8 @@ class AuditExecutor:
     def __init__(self, target_dir: Path, router: ModelRouter,
                  exposure_override: Optional[str] = None,
                  stop_after: Optional[str] = None,
-                 only_partition: Optional[str] = None):
+                 only_partition: Optional[str] = None,
+                 classification: str = "Internal Use Only"):
         self.target_dir = target_dir.resolve()
         self.project = self.target_dir.name
         self.router = router
@@ -70,6 +71,9 @@ class AuditExecutor:
         # bound the run for cheap validation: discovery|prioritization|security|None
         self.stop_after = stop_after
         self.only_partition = only_partition
+        # User-supplied classification marking for report headers/footers (the
+        # agent-mode prompt forbids inventing org-specific markings).
+        self.classification = classification or "Internal Use Only"
 
     # -- infra ---------------------------------------------------------------
 
@@ -108,7 +112,82 @@ class AuditExecutor:
         path = self.tm_dir / name
         return path.read_text(encoding="utf-8") if path.exists() else ""
 
+    def _tm_threat_sections(self, max_chars: int = 30000) -> str:
+        """Extract the threat-bearing sections of 02-threats.md (main threat
+        table, Inferred Threats, Excluded Threats Ledger) instead of naively
+        slicing the file head. 02-threats.md = header + 02a context + 02b
+        threats + 02c assumptions; a head slice can be consumed entirely by
+        the 02a asset/flow tables and never reach a single threat, which would
+        make every finding 'unanticipated'."""
+        full = self._read_tm("02-threats.md")
+        if not full:
+            return ""
+        keep = re.compile(r"threat table|threats|inferred|excluded threats ledger",
+                          re.IGNORECASE)
+        sections: list[str] = []
+        current: list[str] = []
+        keeping = False
+        for line in full.splitlines():
+            if line.startswith("#"):
+                if keeping and current:
+                    sections.append("\n".join(current))
+                current = [line]
+                keeping = bool(keep.search(line))
+            elif keeping:
+                current.append(line)
+        if keeping and current:
+            sections.append("\n".join(current))
+        out = "\n\n".join(sections)
+        if not out.strip():
+            out = full  # fallback: no matching headings, send what we have
+        return out[:max_chars]
+
+    def _tm_state_timestamp(self) -> str:
+        m = re.search(r"^LAST_UPDATED:\s*(.+)$", self._read_tm("STATE.md"),
+                      re.MULTILINE)
+        return m.group(1).strip() if m else ""
+
     # -- file gathering ------------------------------------------------------
+
+    # Secret redaction before file content is sent to any LLM provider (the
+    # default bulk provider is third-party). Mirrors the SECRETS REDACTION rule
+    # in the agent-mode prompts: keep the first 4 chars, mask the rest.
+    _SECRET_LINE = re.compile(
+        r"(?i)^(\s*[\"']?[\w.\-]*(password|passwd|secret|token|api[_-]?key|apikey|"
+        r"access[_-]?key|private[_-]?key|client[_-]?secret|connection[_-]?string)"
+        r"[\w.\-]*[\"']?\s*[:=]\s*)(.+)$")
+    _SECRET_VALUE = re.compile(
+        r"(sk-[A-Za-z0-9_\-]{8,}|AKIA[0-9A-Z]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|"
+        r"xox[baprs]-[A-Za-z0-9\-]{10,})")
+
+    @staticmethod
+    def _mask_secret(val: str) -> str:
+        v = val.strip().strip("\"',;")
+        return "****" if len(v) <= 8 else v[:4] + "****"
+
+    def _redact_secrets(self, text: str) -> str:
+        out: list[str] = []
+        in_pem = False
+        for line in text.splitlines():
+            if "-----BEGIN" in line and "PRIVATE KEY" in line:
+                in_pem = True
+                out.append(line)
+                continue
+            if in_pem:
+                if "-----END" in line:
+                    in_pem = False
+                    out.append(line)
+                else:
+                    out.append("    [REDACTED PRIVATE KEY MATERIAL]")
+                continue
+            m = self._SECRET_LINE.match(line)
+            if m and m.group(3).strip() not in ("", "''", '""', "null", "None", "***"):
+                line = m.group(1) + self._mask_secret(m.group(3))
+            else:
+                line = self._SECRET_VALUE.sub(
+                    lambda mm: self._mask_secret(mm.group(0)), line)
+            out.append(line)
+        return "\n".join(out)
 
     def _gather(self, root: Optional[str] = None, globs: Optional[list] = None) -> str:
         base = self.target_dir / root if root and root != "." else self.target_dir
@@ -130,7 +209,8 @@ class AuditExecutor:
                     continue
                 seen.add(rel)
                 try:
-                    content = path.read_text(encoding="utf-8", errors="ignore")[:MAX_FILE_CHARS]
+                    content = self._redact_secrets(
+                        path.read_text(encoding="utf-8", errors="ignore")[:MAX_FILE_CHARS])
                 except OSError:
                     continue
                 entry = f"### `{rel}`\n```\n{content}\n```\n\n"
@@ -221,6 +301,22 @@ class AuditExecutor:
         self._write("02_risk_prioritization.md", out)
         self._mark("prioritization")
 
+    def _git_exclude_state_dir(self) -> None:
+        """Add audit_state/ to <target>/.git/info/exclude (repo-local,
+        un-committed) so findings and secret locations can't be accidentally
+        committed. Mirrors the threat modeling prompt's technique."""
+        exclude = self.target_dir / ".git" / "info" / "exclude"
+        if not exclude.parent.is_dir():
+            return
+        try:
+            current = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+            if "audit_state/" not in current:
+                with open(exclude, "a", encoding="utf-8") as f:
+                    f.write("\n# Added by code-security-audit-workflow\naudit_state/\n")
+                print("  Added audit_state/ to .git/info/exclude")
+        except OSError as err:
+            print(f"  WARNING: could not update .git/info/exclude: {err}")
+
     def _worker(self, phase: PhaseKind, partition: Partition) -> None:
         step = f"{phase.value}:{partition.id}"
         if self._done(step):
@@ -228,7 +324,7 @@ class AuditExecutor:
             return
         self._bar(f"{'Phase 3A Security' if phase == PhaseKind.SECURITY else 'Phase 4A Architecture'}"
                   f" -- {partition.id}")
-        tm_threats = self._read_tm("02-threats.md")[:12000] if self.mode == "COORDINATED" else ""
+        tm_threats = self._tm_threat_sections(20000) if self.mode == "COORDINATED" else ""
         prior_ctx = ""
         if phase == PhaseKind.ARCHITECTURE:
             sec = self._read(f"workers/{partition.id}/security_review.md")
@@ -252,6 +348,35 @@ class AuditExecutor:
         print(f"  Parsed {len(added)} findings from {partition.id} ({phase.value})")
         self._mark(step)
 
+    def _shared_worker(self, shared: dict) -> None:
+        """Phase 3B/4B -- shared component review. Previously discovery parsed
+        shared_components but nothing ever reviewed them; their findings also
+        need the threat cross-reference in COORDINATED mode or the Phase 5
+        comparison counts don't reconcile."""
+        part = Partition.from_dict(shared)
+        step = f"shared:{part.id}"
+        if self._done(step):
+            print(f"  v {step}")
+            return
+        self._bar(f"Phase 3B/4B Shared Component -- {part.id}")
+        tm_threats = self._tm_threat_sections(20000) if self.mode == "COORDINATED" else ""
+        prior_ctx = (
+            "\nThis is a SHARED COMPONENT used by multiple services: weigh blast "
+            "radius accordingly (deps: shared) and assess architecture concerns "
+            "(coupling, failure modes) alongside security in the same pass.\n")
+        instr = prompts.security_worker_instructions(
+            self.project, part, self.exposure, self.mode == "COORDINATED",
+            prior_ctx, tm_threats)
+        instr += prompts.FINDINGS_SCHEMA_ADDON
+        out = self._call(PhaseKind.SHARED, instr, self._gather(part.root))
+        self._write(f"workers/shared-{part.id}/shared_review.md", out)
+        from .findings import parse_findings
+        raws = parse_findings(out)
+        added = self.registry.add_many(raws, f"shared-{part.id}")
+        self.registry.save()
+        print(f"  Parsed {len(added)} findings from shared component {part.id}")
+        self._mark(step)
+
     def _phase_consolidation(self) -> None:
         if self._done("consolidation"):
             print("  v consolidation");
@@ -270,10 +395,12 @@ class AuditExecutor:
         attack_paths = self._read("attack_paths.md") or "See per-finding evidence."
         # native HTML rendering
         report = render.render_consolidated_report(
-            self.project, self.registry, sections, attack_paths)
+            self.project, self.registry, sections, attack_paths,
+            classification=self.classification)
         self._write("05_consolidated_report.html", report)
         briefing = render.render_executive_briefing(
-            self.project, self.registry, sections.get("summary", ""), attack_paths)
+            self.project, self.registry, sections.get("summary", ""), attack_paths,
+            classification=self.classification)
         self._write("executive_briefing.html", briefing)
         self._write("consolidation_sections.md", out)
         self._mark("consolidation")
@@ -285,10 +412,21 @@ class AuditExecutor:
             print("  v comparison");
             return
         self._bar("Phase 5/6 -- Threat-Audit Comparison")
-        # binding verification
-        recorded = self._read("coordination_mode.md")
-        cur = self._read_tm("STATE.md")
-        # (timestamps compared loosely; full binding check is a follow-up)
+        # Binding verification (per the agent-mode prompt): if the threat model
+        # was re-run mid-audit, findings reference threats that no longer exist
+        # on disk -- refuse to produce the comparison.
+        m = re.search(r"^THREAT_MODEL_LAST_UPDATED:\s*(.+)$",
+                      self._read("coordination_mode.md"), re.MULTILINE)
+        bound = m.group(1).strip() if m else ""
+        current = self._tm_state_timestamp()
+        if bound and current and bound != current:
+            print("\n  === BINDING ERROR: THREAT MODEL CHANGED DURING AUDIT ===")
+            print(f"  Bound at Phase 1: {bound}")
+            print(f"  Current:          {current}")
+            print("  Re-run the audit against the current threat model, or restore")
+            print("  the original threat model state from git. Comparison NOT produced.")
+            return
+
         def block(findings):
             out = []
             for f in findings:
@@ -299,13 +437,17 @@ class AuditExecutor:
                            f"  fix: {str(f.get('fix') or '').strip()[:400]}")
             return "\n".join(out) or "None."
         instr = prompts.comparison_instructions(
-            self.project, self._read_tm("02-threats.md")[:14000],
+            self.project, self._tm_threat_sections(20000),
             block(self.registry.by_threat_match("confirms")),
             block(self.registry.by_threat_match("partial")),
-            block(self.registry.by_threat_match("unanticipated")))
+            block(self.registry.by_threat_match("unanticipated")),
+            promoted=block(self.registry.by_threat_match("promotes-inferred")),
+            contradicts=block(self.registry.by_threat_match("contradicts-exclusion")),
+            excluded_by_design=block(self.registry.by_threat_match("excluded-by-design")))
         md = self._call(PhaseKind.COMPARISON, instr, max_tokens=MAX_TOKENS_JUDGMENT)
         self._write("threat_audit_comparison.md", md)
-        html = render.render_comparison_html(self.project, md)
+        html = render.render_comparison_html(self.project, md,
+                                             classification=self.classification)
         self._write("threat_audit_comparison.html", html)
         # reciprocal copy to threat model dir
         if self.tm_dir:
@@ -331,11 +473,46 @@ class AuditExecutor:
             sections["summary"] = text
         return sections
 
+    def _count_tm_threats(self) -> tuple[int, int, int]:
+        """Count main-table threats, Inferred threats, and Excluded Threats
+        Ledger rows in 02-threats.md (best effort, table-row heuristics)."""
+        text = self._read_tm("02-threats.md")
+        main = inferred = excluded = 0
+        for line in text.splitlines():
+            s = line.strip()
+            if not s.startswith("|") or set(s.replace("|", "").replace("-", "")
+                                            .replace(":", "").replace(" ", "")) == set():
+                continue
+            first = s.strip("|").split("|")[0].strip()
+            up = first.upper()
+            if up in ("THREATID", "EXCLUDEDID", "ID"):
+                continue  # header row, not a data row
+            if up.startswith("EX-"):
+                excluded += 1
+            elif up.startswith("INF"):
+                inferred += 1
+            elif up.startswith("THR") or re.fullmatch(r"\d{4}", first):
+                main += 1
+        return main, inferred, excluded
+
     def _write_coordination_mode(self) -> None:
-        lines = [f"# Audit Coordination Mode\n\nMODE: {self.mode}\n"]
+        from datetime import datetime
+        lines = [f"# Audit Coordination Mode\n\nMODE: {self.mode}\n",
+                 f"DETECTED: {datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}\n"]
         if self.mode == "COORDINATED" and self.tm_dir:
+            main, inferred, excluded = self._count_tm_threats()
+            # Preserve the timestamp recorded at the FIRST run of this audit:
+            # it is the binding contract Phase 5 verifies. Re-recording the
+            # current value on every resume would make verification vacuous.
+            prev = re.search(r"^THREAT_MODEL_LAST_UPDATED:\s*(.+)$",
+                             self._read("coordination_mode.md"), re.MULTILINE)
+            bound = prev.group(1).strip() if prev else self._tm_state_timestamp()
             lines.append(f"THREAT_MODEL_PATH: {self.tm_dir.name}/\n")
+            lines.append(f"THREAT_MODEL_LAST_UPDATED: {bound}\n")
             lines.append(f"DEPLOYMENT_EXPOSURE: {self.exposure}\n")
+            lines.append(f"THREAT_COUNT_MAIN: {main}\n")
+            lines.append(f"THREAT_COUNT_INFERRED: {inferred}\n")
+            lines.append(f"EXCLUDED_LEDGER_COUNT: {excluded}\n")
         else:
             lines.append(f"DEPLOYMENT_EXPOSURE: {self.exposure}\n")
         self._write("coordination_mode.md", "".join(lines))
@@ -366,6 +543,7 @@ class AuditExecutor:
 
     def run(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._git_exclude_state_dir()
         self._load_state()
         if self.exposure == "Unknown" or not self.completed:
             self._resolve_exposure()
@@ -388,6 +566,9 @@ class AuditExecutor:
             return self._stop_early("security")
         for p in active:
             self._worker(PhaseKind.ARCHITECTURE, p)
+        if not self.only_partition:
+            for s in self.shared:
+                self._shared_worker(s)
         self._phase_consolidation()
         self._phase_comparison()
 

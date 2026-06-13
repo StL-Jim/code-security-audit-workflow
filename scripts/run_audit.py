@@ -55,6 +55,10 @@ def main():
                         help="Stop early for a cheap validation run")
     parser.add_argument("--only-partition", default=None, metavar="ID",
                         help="Review only this partition id (debug / re-run a single worker)")
+    parser.add_argument("--classification", default="Internal Use Only",
+                        metavar="TEXT",
+                        help='Classification marking for report headers/footers '
+                             '(default: "Internal Use Only")')
     args = parser.parse_args()
 
     target_dir = Path(args.target)
@@ -78,7 +82,8 @@ def main():
 
     executor = AuditExecutor(target_dir, router, exposure_override=args.exposure,
                              stop_after=args.stop_after,
-                             only_partition=args.only_partition)
+                             only_partition=args.only_partition,
+                             classification=args.classification)
     executor.run()
 
 

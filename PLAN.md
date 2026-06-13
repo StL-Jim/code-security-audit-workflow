@@ -55,18 +55,48 @@ that quotes inline scalars; regression test added.
 Also raised judgment-phase max_tokens to 16000 (prioritization truncated at the
 8192 default on a 13-partition repo).
 
+## UPDATED 2026-06-12 -- synced to revised prompts
+
+The agent-mode prompts (GenAIPrompts) were revised 2026-06-12; this workflow
+was brought in line the same day:
+- data/input prompt copy re-synced to the revised code-security-audit.md.
+- threat_match enum extended: promotes-inferred (Inferred-table match),
+  contradicts-exclusion / excluded-by-design (Excluded Threats Ledger match);
+  worker + comparison instructions teach the full matching order.
+- Comparison output now severity-floor stratified (Critical/High unanticipated
+  reported separately from Medium/Low/Info expected non-matches).
+- 02-threats.md is now section-extracted (threat tables + Inferred + ledger)
+  instead of head-sliced -- the old [:12000] slice could be consumed entirely
+  by 02a context and starve the cross-reference.
+- coordination_mode.md enriched (THREAT_MODEL_LAST_UPDATED, THREAT_COUNT_MAIN/
+  INFERRED, EXCLUDED_LEDGER_COUNT); binding verification implemented in
+  _phase_comparison (refuses comparison if the threat model changed mid-audit).
+- Phase 3B/4B shared-component review implemented (_shared_worker) with the
+  threat cross-reference; previously shared components were parsed and ignored.
+- Secrets redaction: rule added to SYSTEM_PROMPT and a masking pass in
+  _gather() before content reaches any provider.
+- audit_state/ auto-added to <target>/.git/info/exclude.
+- cat: ARCH allowed for non-OWASP architecture findings.
+- Classification marking is user-supplied via --classification (default
+  "Internal Use Only"), no longer hard-coded.
+
 ## NOT YET DONE (next session, optional)
 
-1. One full end-to-end run (all 13 partitions + consolidation + comparison) to
-   produce the complete deliverable set and a real total in costs.md. ~$1 on
-   MiniMax. Everything it exercises has been validated piecewise.
+1. One full end-to-end run (all 13 partitions + shared components +
+   consolidation + comparison) to produce the complete deliverable set and a
+   real total in costs.md. ~$1 on MiniMax. Everything it exercises has been
+   validated piecewise, but the 2026-06-12 changes are live-untested.
 2. Live test of consolidation prose + COORDINATED comparison Markdown (the
    renderers they feed are proven; only the LLM prose calls are live-untested).
 3. C4_architecture.md generation from c4_input.md (currently a stub file is
    written; the Mermaid generation step is not implemented).
 4. security_architecture_audit.md idempotent cross-run log (not implemented).
-5. Full threat-model binding verification (timestamp compare) in Phase 5 --
-   currently a soft no-op; see `_phase_comparison`.
+   When built, follow the revised prompt: match cross-run findings by the
+   stable content key (pid + src file + sub + normalized title), update in
+   place, never key on the date-based finding id.
+5. attack_paths.md is never produced (consolidation falls back to a
+   placeholder). The revised prompt now defines an AP-NNN schema; implement
+   generation against it.
 6. Optional: copy `app.py` Streamlit refiner from the threat repo if a
    partition-plan review UI is wanted.
 7. Verify MiniMax-M3 real pricing and update MODEL_PRICING in providers.py
